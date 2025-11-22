@@ -1,0 +1,141 @@
+import random
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from datetime import datetime
+
+app = Flask(_name_)
+CORS(app)
+
+# Align faults list with implemented types
+FAULTS = ["imbalance", "short", "arcing", "open_circuit"]
+
+# Reference Line Impedance (Ohms)
+LINE_IMPEDANCE = {"A": 1, "B": 1.3, "C": 1.4}
+
+# Global storage for Phase A (ESP32 live data)
+phaseA_data = None
+
+def calculate_z_app(voltage, current):
+    """Calculate apparent impedance using (230 - V) / I"""
+    if current > 0:
+        return round((230 - voltage) / current, 2)
+    return float('inf')
+
+def generate_normal_data(phase_name):
+    voltage = random.randint(215, 230)
+    current = random.uniform(8, 12)
+    power = round(voltage * current, 2)
+
+    z_line = LINE_IMPEDANCE[phase_name]
+    z_app = calculate_z_app(voltage, current)
+
+    details = "Healthy phase"
+    fault = "normal"
+
+    if z_app > (5 * z_line):
+        details = f"{phase_name} Line Break Detected (Open Fault: Z_app={z_app} >> Z_line={z_line})"
+        fault = "break"
+
+    return {
+        "voltage": voltage,
+        "current": round(current, 2),
+        "power": power,
+        "z_line": z_line,
+        "z_app": z_app,
+        "fault": fault,
+        "details": details
+    }
+
+def apply_fault(phase_name, data, fault_type):
+    if fault_type == "imbalance":
+        data["voltage"] = random.randint(150, 190)
+        data["power"] = round(data["voltage"] * data["current"], 2)
+        data["details"] = f"{phase_name} Phase Imbalance (voltage dip)"
+
+    elif fault_type == "short":
+        data["voltage"] = random.randint(50, 80)
+        data["current"] = round(random.uniform(40, 100), 2)
+        data["power"] = round(data["voltage"] * data["current"], 2)
+        data["details"] = f"{phase_name} Possible Short Circuit (low V, high I)"
+
+    elif fault_type == "arcing":
+        data["current"] = round(random.uniform(3, 10), 2)
+        data["voltage"] = random.randint(175, 190)
+        data["power"] = round(data["voltage"] * data["current"], 2)
+        data["details"] = f"{phase_name} Fault Detected Possible Arcing"
+
+    elif fault_type == "open_circuit":
+        data["voltage"] = 225
+        data["current"] = 3
+        data["details"] = f"{phase_name} Open Circuit Detected (No current flow)"
+
+    data["z_app"] = calculate_z_app(data["voltage"], data["current"])
+    data["fault"] = fault_type
+    return data
+
+@app.route('/api/upload', methods=['POST'])
+def upload_data():
+    """Receive Phase A data from ESP32"""
+    global phaseA_data
+    data = request.json
+
+    if not data:
+        return jsonify({"status": "error", "message": "No JSON received"}), 400
+
+    print("\n📥 Received ESP32 Data:")
+    print(data)
+
+    # Convert to expected format
+    phaseA_data = {
+        "voltage": round(float(data.get("voltage", 0)), 2),
+        "current": round(float(data.get("current", 0)), 2),
+        "power": round(float(data.get("power", 0)), 2),
+        "energy": round(float(data.get("energy", 0)), 4),
+        "z_line": LINE_IMPEDANCE["A"],
+        "z_app": calculate_z_app(float(data.get("voltage", 0)), float(data.get("current", 1))),
+        "fault": "normal",
+        "details": "Live ESP32 Phase A data"
+    }
+
+    return jsonify({"status": "ok", "message": "Data stored", "phaseA": phaseA_data})
+
+@app.route('/api/data')
+def get_data():
+    # Use ESP32 data if available
+    if phaseA_data:
+        phaseA = phaseA_data.copy()
+    else:
+        phaseA = generate_normal_data("A")
+
+    # Simulate B and C
+    phaseB = generate_normal_data("B")
+    phaseC = generate_normal_data("C")
+
+    if random.random() < 0.1:  
+        fault_phase = random.choice(["B", "C"])  # Only inject into B or C
+        fault_type = random.choice(FAULTS)
+        if fault_phase == "B" and phaseB["fault"] == "normal":
+            phaseB = apply_fault("Phase B", phaseB, fault_type)
+        elif fault_phase == "C" and phaseC["fault"] == "normal":
+            phaseC = apply_fault("Phase C", phaseC, fault_type)
+
+    total_consumption = phaseA["power"] + phaseB["power"] + phaseC["power"]
+
+    faults = []
+    for phase in [phaseA, phaseB, phaseC]:
+        if phase["fault"] != "normal":
+            faults.append(phase["details"])
+
+    fault_description = "; ".join(faults) if faults else "All phases normal"
+
+    return jsonify({
+        "phaseA": phaseA,
+        "phaseB": phaseB,
+        "phaseC": phaseC,
+        "total_consumption": round(total_consumption, 2),
+        "faults": fault_description,
+        "timestamp": datetime.now().strftime("%H:%M:%S")
+    })
+
+if _name_ == '_main_':
+    app.run(host="0.0.0.0", port=5000, debug=True)
