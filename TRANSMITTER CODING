@@ -1,0 +1,277 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// ==================== Pin Config ====================
+// NOTE: You are using pins 2,4,10 here for sensors/relay.
+//       Make sure they are ADC-capable / safe on your S3 board.
+#define CT_PIN     4        // CT sensor (ADC)
+#define VOLT_PIN   2        // ZMPT101B (ADC)
+#define RELAY_PIN 10        // Relay control pin (Active LOW)
+
+// ==================== LoRa RA-02 (SX1278 433 MHz) ====================
+#define LORA_CS    15
+#define LORA_RST   16
+#define LORA_DIO0  21
+#define LORA_SCK   36
+#define LORA_MISO  37
+#define LORA_MOSI  35
+#define LORA_FREQ  433E6    // 433 MHz (your current module)
+
+// Simple ID for this node (pole / transformer)
+#define NODE_ID    101
+
+// ==================== ADC Config ====================
+#define VREF     3.3
+#define ADC_MAX  4095
+#define SAMPLES  1000
+
+// ==================== CT Constants ====================
+// SCT-013-030: 1V @ 30A
+const float CT_V_AT_RATED = 1.0;
+const float CT_RATED_A    = 30.0;
+const float CT_K          = CT_RATED_A / CT_V_AT_RATED;
+float CT_CAL              = 3.8;   // your calibration factor
+
+// Auto-calibrated noise floor (in amps)
+float CT_NOISE_A = 0.3;   // default, will be updated at startup
+
+// ==================== Voltage Sensor (ZMPT) ====================
+// Vrms = vrms_sensor * V_CAL, tuned by multimeter
+float V_CAL    = 410.0;   // adjust with multimeter
+float V_OFFSET = 0.0;     // auto-calibrated later (raw offset)
+
+// ==================== Bias ====================
+float vbias_ct = ADC_MAX / 2.0;
+float vbias_v  = ADC_MAX / 2.0;
+
+// ==================== Thresholds ====================
+const float V_THRESHOLD = 20.0;   // Vrms threshold
+const float I_THRESHOLD = 0.500;  // Arms threshold
+
+// ==================== System State ====================
+bool faultLatched = false;
+
+// ==================== Relay Helpers ====================
+// Active LOW relay: LOW = ON, HIGH = OFF
+void relayOn()  { digitalWrite(RELAY_PIN, LOW); }
+void relayOff() { digitalWrite(RELAY_PIN, HIGH); }
+
+// ==================== ADC / Measure Helpers ====================
+void setupADC() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(CT_PIN,   ADC_11db);
+  analogSetPinAttenuation(VOLT_PIN, ADC_11db);
+}
+
+float calibrateBias(int pin) {
+  long sum = 0;
+  for (int i = 0; i < 500; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  return (float)sum / 500.0f;
+}
+
+// Generic RMS measurement (centered around vbias)
+float measureVrmsSensor(int pin, float vbias) {
+  double sumSq = 0.0;
+  for (int i = 0; i < SAMPLES; i++) {
+    int   adc  = analogRead(pin);
+    float diff = (float)adc - vbias;
+    sumSq += diff * diff;
+    delayMicroseconds(200);
+  }
+  float countsRms = sqrt(sumSq / (double)SAMPLES);
+  return (countsRms / ADC_MAX) * VREF;  // Vrms at ADC in volts
+}
+
+// Raw current (before noise floor)
+float measureCurrentRaw() {
+  float vrms_ct = measureVrmsSensor(CT_PIN, vbias_ct);  // volts at ADC
+  float I       = vrms_ct * CT_K * CT_CAL;              // amps
+  return I;
+}
+
+// Current with noise floor applied
+float measureCurrent() {
+  float I_raw = measureCurrentRaw();
+  // Auto-calibrated noise floor
+  float floor = CT_NOISE_A + 0.05f; // small margin
+  if (I_raw <= floor) return 0.0f;
+  return I_raw;
+}
+
+// Raw voltage (no offset) from ZMPT
+float measureVoltageRaw() {
+  float vrms_v = measureVrmsSensor(VOLT_PIN, vbias_v);
+  return vrms_v * V_CAL;  // Vrms mains estimate (before offset)
+}
+
+// Voltage with offset correction
+float measureVoltage() {
+  float Vr = measureVoltageRaw() - V_OFFSET;
+  if (Vr < 0) Vr = 0;
+  return Vr;
+}
+
+// ==================== LoRa Helpers ====================
+bool loraReady = false;
+
+void setupLoRa() {
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("[ERR] LoRa init failed (check wiring/module)");
+    loraReady = false;
+    return;
+  }
+
+  LoRa.setSpreadingFactor(10);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setTxPower(14);     // dBm (respect module & local regs)
+  LoRa.enableCrc();
+
+  loraReady = true;
+  Serial.println("[OK] LoRa started @ 433 MHz");
+}
+
+// Send compact status packet to EB
+// statusCode: 0=Manual OFF, 1=Normal, 2=Fault
+void sendStatusLoRa(float V, float I, int statusCode, bool latched) {
+  if (!loraReady) return;
+
+  // Small CSV-like payload: ID,V,I,status,latched
+  // Example: "ID=101,V=230.5,I=0.123,S=2,L=1"
+  String p;
+  p.reserve(64);
+  p  = "ID=";   p += NODE_ID;
+  p += ",V=";   p += String(V, 1);
+  p += ",I=";   p += String(I, 3);
+  p += ",S=";   p += statusCode;
+  p += ",L=";   p += (latched ? 1 : 0);
+
+  LoRa.beginPacket();
+  LoRa.print(p);
+  LoRa.endPacket(true); // async
+
+  Serial.print("[LoRa TX] ");
+  Serial.println(p);
+}
+
+// ==================== Setup ====================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println("=== GUARDIANS OF GRID – Node with LoRa + Auto Calibration ===");
+
+  setupADC();
+
+  // ===== Bias calibration =====
+  Serial.println("Calibrating ADC bias (CT + Voltage)...");
+  vbias_ct = calibrateBias(CT_PIN);
+  vbias_v  = calibrateBias(VOLT_PIN);
+  Serial.print("vbias_ct = "); Serial.println(vbias_ct, 1);
+  Serial.print("vbias_v  = "); Serial.println(vbias_v,  1);
+
+  // GPIO
+  pinMode(RELAY_PIN, OUTPUT);
+  relayOff(); // Default OFF (safe)
+
+  // ===== Auto-calibrate voltage offset =====
+  Serial.println("Calibrating voltage offset... (ensure mains OFF)");
+  delay(2000);
+  V_OFFSET = measureVoltageRaw();
+  Serial.print("V_OFFSET (raw) = ");
+  Serial.println(V_OFFSET, 3);
+
+  // ===== Auto-calibrate CT noise floor =====
+  Serial.println("Calibrating CT noise floor... (ensure NO LOAD)");
+  delay(1000);
+  // Measure "current" at 0 A load to get baseline noise
+  float I_noise = measureCurrentRaw();
+  CT_NOISE_A = I_noise;
+  Serial.print("CT_NOISE_A (baseline) = ");
+  Serial.println(CT_NOISE_A, 3);
+
+  // LoRa
+  setupLoRa();
+
+  Serial.println("System Ready.");
+  Serial.println("Commands: RESET (clear fault), RESETV (recalibrate voltage offset).");
+  Serial.println("Serial Plot format: V  I  statusCode");
+}
+
+// ==================== Loop ====================
+void loop() {
+  float I = measureCurrent();
+  float V = measureVoltage();
+  int statusCode = 0; // 0=Manual OFF, 1=Normal, 2=Fault
+
+  if (!faultLatched) {
+    if (V > V_THRESHOLD && I > I_THRESHOLD) {
+      // Normal
+      relayOn();
+      statusCode = 1;
+      Serial.println("✅ Normal -> Relay ON");
+    }
+    else if (V > V_THRESHOLD && I < I_THRESHOLD) {
+      // Fault
+      faultLatched = true;
+      relayOff();
+      statusCode = 2;
+      Serial.println("⚠️ FAULT DETECTED -> Relay OFF (Latched)");
+    }
+    else if (V < V_THRESHOLD && I < I_THRESHOLD) {
+      // Manual OFF
+      relayOff();
+      statusCode = 0;
+      Serial.println("Manual OFF -> Relay OFF");
+    }
+  }
+  else {
+    // Fault latched
+    relayOff();
+    statusCode = 2;
+    Serial.println("FAULT STATE - Type RESET to recheck system.");
+
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd.equalsIgnoreCase("RESET")) {
+        Serial.println("🔄 RESET received - Testing relay...");
+        relayOn();
+        delay(1000); // Relay ON for 1s test
+        I = measureCurrent();
+        V = measureVoltage();
+        if (V > V_THRESHOLD && I > I_THRESHOLD) {
+          faultLatched = false;
+          Serial.println("✅ Fault cleared -> Relay ON");
+        } else {
+          relayOff();
+          Serial.println("⚠️ Fault persists -> Relay OFF (Latched)");
+        }
+      }
+      if (cmd.equalsIgnoreCase("RESETV")) {
+        Serial.println("🔄 RESETV received - Recalibrating voltage offset...");
+        V_OFFSET = measureVoltageRaw();
+        Serial.print("New V_OFFSET: ");
+        Serial.println(V_OFFSET, 3);
+      }
+    }
+  }
+
+  // ---- Serial Plotter ----
+  Serial.print(V, 1);   Serial.print(" ");
+  Serial.print(I, 3);   Serial.print(" ");
+  Serial.println(statusCode);
+
+  // ---- LoRa uplink to EB office ----
+  sendStatusLoRa(V, I, statusCode, faultLatched);
+
+  delay(1000);
+}
+
