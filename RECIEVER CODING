@@ -1,0 +1,106 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// ==================== LoRa RA-02 (SX1278 433 MHz) ====================
+#define LORA_CS    15
+#define LORA_RST   16
+#define LORA_DIO0  21
+#define LORA_SCK   36
+#define LORA_MISO  37
+#define LORA_MOSI  35
+#define LORA_FREQ  433E6
+
+struct NodeData {
+  uint32_t lastUpdate;
+  int      id;
+  float    V;
+  float    I;
+  int      status;  // 0=Manual OFF, 1=Normal, 2=Fault
+  bool     latched;
+};
+
+NodeData data;
+
+// ==================== Parser ====================
+bool parsePacket(const String &p) {
+  int idxID = p.indexOf("ID=");
+  int idxV  = p.indexOf("V=");
+  int idxI  = p.indexOf("I=");
+  int idxS  = p.indexOf("S=");
+  int idxL  = p.indexOf("L=");
+
+  if (idxID < 0 || idxV < 0 || idxI < 0 || idxS < 0 || idxL < 0)
+    return false;
+
+  auto extract = [&](int start) -> String {
+    int end = p.indexOf(',', start);
+    if (end < 0) end = p.length();
+    return p.substring(start, end);
+  };
+
+  data.id      = extract(idxID + 3).toInt();
+  data.V       = extract(idxV  + 2).toFloat();
+  data.I       = extract(idxI  + 2).toFloat();
+  data.status  = extract(idxS  + 2).toInt();
+  data.latched = (extract(idxL + 2).toInt() == 1);
+
+  return true;
+}
+
+// ==================== LoRa Setup ====================
+void setupLoRa() {
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("[ERROR] LoRa init failed!");
+    while (1) delay(1000);
+  }
+
+  LoRa.setSpreadingFactor(10);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setTxPower(14);
+  LoRa.enableCrc();
+
+  Serial.println("[OK] LoRa Receiver Ready @ 433 MHz");
+}
+
+// ==================== Setup ====================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== EB LoRa Receiver – GUARDIANS OF GRID ===");
+  setupLoRa();
+}
+
+// ==================== Loop ====================
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String rx = "";
+    while (LoRa.available()) rx += (char)LoRa.read();
+
+    Serial.print("[RX RAW] ");
+    Serial.println(rx);
+
+    if (parsePacket(rx)) {
+      data.lastUpdate = millis();
+
+      Serial.print("[UPDATE] ID=");
+      Serial.print(data.id);
+      Serial.print("  V=");
+      Serial.print(data.V, 1);
+      Serial.print("V  I=");
+      Serial.print(data.I, 3);
+      Serial.print("A  Status=");
+      Serial.print(data.status);
+      Serial.print("  Latched=");
+      Serial.println(data.latched ? "YES" : "NO");
+    } 
+    else {
+      Serial.println("[WARN] Parse Failed!");
+    }
+  }
+}
